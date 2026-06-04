@@ -8,3 +8,5 @@ models_local/
 *.parquet
 *.csv.gz
 *.json.gz
+._*
+**/.___*
