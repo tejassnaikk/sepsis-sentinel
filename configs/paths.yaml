@@ -1,0 +1,8 @@
+data:
+  raw: /Volumes/Tejas SSD/sepsis-sentinel/data/raw
+  delta: /Volumes/Tejas SSD/sepsis-sentinel/data/delta
+  logs: /Volumes/Tejas SSD/sepsis-sentinel/data/logs
+models:
+  local: /Volumes/Tejas SSD/sepsis-sentinel/models_local
+reports:
+  root: /Volumes/Tejas SSD/sepsis-sentinel/reports
