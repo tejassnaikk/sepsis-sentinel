@@ -4,7 +4,6 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .DS_Store
-models_local/
 *.parquet
 *.csv.gz
 *.json.gz
