@@ -57,6 +57,7 @@ def _build_window_grid(
         / 3600
     )
     # At least one window per stay regardless of LOS
+    los_hours = los_hours.fillna(window_hours)
     n_windows = np.maximum(1, np.floor(los_hours / window_hours).astype(int))
 
     # Vectorised expansion: repeat each stay_id n_windows times, then generate
