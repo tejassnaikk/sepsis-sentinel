@@ -1,23 +1,14 @@
-# SepsisSentinel — Model Evaluation Report
+# SepsisSentinel Model Metrics
 
-Generated: 2026-06-10 19:57 UTC  
-Model: XGBoost  
-Decision threshold: 0.35
+## Training (features_v1.parquet, 889k windows)
+- AUROC: 0.806
+- AUPRC: 0.609
+- Recall@0.35: 0.878
 
-## Performance Metrics
-
-| Metric | Value |
-| --- | --- |
-| AUROC | 0.8060 |
-| AUPRC | 0.6094 |
-| Precision (t=0.35) | 0.4036 |
-| Recall    (t=0.35) | 0.8776 |
-| F1        (t=0.35) | 0.5529 |
-
-## Test Set Composition
-
-| | Count | % |
-| --- | --- | --- |
-| Positive (sepsis) | 35,462 | 26.8% |
-| Negative          | 97,066 | 73.2% |
-| Total             | 132,528 | 100.0% |
+## Full Cohort Inference (934,767 windows, all 65,366 ICU stays)
+- AUROC: 0.799
+- AUPRC: 0.572
+- Recall@0.35: 0.864
+- Alert rate: 55.6% (threshold=0.35)
+- Confusion: TP=198,883 FP=321,236 TN=383,364 FN=31,284
+- Prob range: 0.005 - 0.995
