@@ -1,20 +1,24 @@
 """
-SepsisSentinel REST API.
+SepsisSentinel REST API — v3.
 
-Serves a trained XGBoost sepsis-prediction model via three endpoints:
-GET /health, POST /predict, GET /features.
+Serves a trained XGBoost v3 sepsis-prediction model (63 features: 40 base
++ 10 lag-1 + 10 delta + n_missing_vitals + n_missing_vitals_lag1 + missing_trend)
+via three endpoints: GET /health, POST /predict, GET /features.
 
-The model file is loaded once at startup via FastAPI's lifespan mechanism.
-All incoming feature fields are optional; missing values are imputed server-
-side before inference so the API tolerates incomplete ICU observations.
+The model file (xgboost_v3.json) and feature column list (feature_cols_v3.json)
+are loaded once at startup via FastAPI's lifespan mechanism. XGBoost v3 handles
+NaN natively; None values in the feature vector are passed through as NaN without
+explicit imputation. Lag and delta features are computed from the optional
+previous_window field when provided.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -32,25 +36,47 @@ logger = logging.getLogger(__name__)
 VITAL_ITEMIDS: list[int] = [220045, 220179, 220210, 220277, 223761, 223900]
 LAB_ITEMIDS:   list[int] = [50912,  50813,  51301,  50885]
 
-_ALERT_THRESHOLD: float = 0.35
-_MODEL_VERSION:   str   = "v1"
-# Model path resolved relative to this file so the API works from any cwd
+_ALERT_THRESHOLD: float = 0.49
+_MODEL_VERSION:   str   = "v3"
+
 _MODEL_PATH: Path = (
-    Path(__file__).resolve().parent.parent.parent / "models_local" / "xgboost_v1.json"
+    Path(__file__).resolve().parent.parent.parent / "models_local" / "xgboost_v3.json"
 )
+_FEATURE_COLS_PATH: Path = (
+    Path(__file__).resolve().parent.parent.parent / "models_local" / "feature_cols_v3.json"
+)
+
+# Populated at startup from feature_cols_v3.json; empty list until then
+FEATURE_COLS: list[str] = []
+
+# Base columns for which lag-1 and delta features are computed (10 total)
+BASE_VITAL_MEANS: list[str] = [
+    "vital_220045_mean", "vital_220179_mean", "vital_220210_mean",
+    "vital_220277_mean", "vital_223761_mean", "vital_223900_mean",
+]
+BASE_LAB_LASTS: list[str] = [
+    "lab_50912_last", "lab_50813_last", "lab_51301_last", "lab_50885_last",
+]
 
 # ---------------------------------------------------------------------------
 # Pydantic input model
 #
 # Built programmatically so field names are derived from the same itemid
 # constants used in feature_engineering.py — editing one place updates both.
-# All 40 feature fields are Optional[...] = None because ICU data is routinely
-# incomplete and missing-value handling is the server's responsibility.
+# All 40 base feature fields are Optional[...] = None. The extra
+# previous_window field accepts the prior window's base features for lag+delta
+# computation; stay_id is echoed in the response for client-side correlation.
 # ---------------------------------------------------------------------------
+
 
 def _make_patient_features_model() -> type[BaseModel]:
     """Build the PatientFeatures Pydantic model from VITAL_ITEMIDS / LAB_ITEMIDS."""
     fields: dict[str, Any] = {}
+
+    fields["stay_id"] = (
+        Optional[int],
+        Field(default=None, description="ICU stay identifier — echoed in the response"),
+    )
 
     for iid in VITAL_ITEMIDS:
         for stat in ("mean", "min", "max", "std"):
@@ -86,16 +112,23 @@ def _make_patient_features_model() -> type[BaseModel]:
               description="Hour of day at window end (0–23)"),
     )
 
+    fields["previous_window"] = (
+        Optional[Dict[str, float]],
+        Field(default=None,
+              description=(
+                  "Previous 6h window's base feature values (same field names as "
+                  "this request). When provided, enables lag-1 and delta features."
+              )),
+    )
+
     return create_model("PatientFeatures", **fields)
 
 
-# The type annotation is BaseModel so IDEs don't complain about the dynamic class;
-# at runtime this is a full Pydantic v2 model with all 40 fields.
 PatientFeatures: type[BaseModel] = _make_patient_features_model()
 PatientFeatures.__doc__ = (
     "One non-overlapping observation window for a single ICU patient. "
-    "All fields are optional — send None or omit any measurement that was "
-    "unavailable in the window.  Missing-value imputation is handled server-side."
+    "All base feature fields are optional — send None or omit any measurement "
+    "that was unavailable. Supply previous_window to enable lag and delta features."
 )
 
 # ---------------------------------------------------------------------------
@@ -108,13 +141,15 @@ class HealthResponse(BaseModel):
 
     status: str
     model_loaded: bool
+    model_version: str
 
 
 class PredictionResponse(BaseModel):
     """Response body for POST /predict."""
 
+    stay_id: Optional[int]
     sepsis_probability: float
-    alert: bool
+    sepsis_alert: bool
     threshold: float
     model_version: str
 
@@ -130,8 +165,7 @@ class FeaturesResponse(BaseModel):
 # Application state
 #
 # Stored in a plain module-level dict so helpers can read it without needing
-# a reference to the app object.  FastAPI's app.state would work too, but
-# accessing it from outside a request context requires the app handle.
+# a reference to the app object.
 # ---------------------------------------------------------------------------
 
 _state: dict[str, Any] = {
@@ -140,13 +174,13 @@ _state: dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
-# Lifespan — model is loaded here, once, before the first request is served
+# Lifespan — model and feature column list loaded here, once, before first request
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the XGBoost model on startup; yield; nothing to close on shutdown."""
+    """Load the XGBoost v3 model and feature_cols_v3.json on startup."""
     if not _MODEL_PATH.exists():
         logger.warning(
             "Model file not found: %s  — /health will report model_loaded=false",
@@ -157,9 +191,6 @@ async def lifespan(app: FastAPI):
             m = xgb.XGBClassifier()
             m.load_model(_MODEL_PATH)
             _state["model"] = m
-            # feature_names is the authoritative column order embedded in the
-            # model file — using it here guarantees inference column order is
-            # always consistent with training, even if constants drift.
             _state["feature_columns"] = list(m.get_booster().feature_names or [])
             logger.info(
                 "Model loaded | path=%s | features=%d",
@@ -171,9 +202,21 @@ async def lifespan(app: FastAPI):
                 "Model load failed: %s  — /health will report model_loaded=false", exc
             )
 
-    yield  # application runs here
+    if not _FEATURE_COLS_PATH.exists():
+        logger.warning(
+            "Feature columns file not found: %s  — /features will use model feature_names",
+            _FEATURE_COLS_PATH,
+        )
+    else:
+        try:
+            with open(_FEATURE_COLS_PATH) as fh:
+                loaded: list[str] = json.load(fh)
+            FEATURE_COLS.extend(loaded)
+            logger.info("Feature columns loaded: %d columns", len(FEATURE_COLS))
+        except Exception as exc:
+            logger.error("Feature columns load failed: %s", exc)
 
-    # XGBoost has no resources to release; nothing to do on shutdown
+    yield  # application runs here
 
 
 # ---------------------------------------------------------------------------
@@ -183,71 +226,80 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SepsisSentinel",
     description=(
-        "Real-time ICU sepsis prediction API.  "
-        "Accepts windowed vital-sign and lab features; returns a calibrated "
-        "sepsis probability and binary alert flag."
+        "Real-time ICU sepsis prediction API — v3 (63 features with lag+delta).  "
+        "Accepts windowed vital-sign and lab features plus an optional previous window; "
+        "returns a calibrated sepsis probability and binary alert flag."
     ),
-    version="1.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
-# Imputation helper
+# Feature builder
 # ---------------------------------------------------------------------------
 
 
-def _build_feature_row(features: BaseModel) -> pd.DataFrame:
-    """Impute None → 0.0, propagate missing flags, return a model-ready DataFrame.
+def _build_feature_row(request: BaseModel) -> pd.DataFrame:
+    """Build a 63-element feature vector from a PatientFeatures request.
 
-    Two-step imputation strategy
-    ----------------------------
-    1.  Every None field is replaced with 0.0.  For missing-flag fields this
-        means "flag = 0" (data was present) — which the second step corrects
-        wherever necessary.
-    2.  For each VALUE field that was originally None (vital stat or lab result),
-        the corresponding *_missing flag is forced to 1.0.  This overrides
-        whatever the caller sent for that flag, ensuring the model always
-        receives a consistent signal when a measurement is absent.
+    Feature composition
+    -------------------
+    Base (40):     all vital/lab stats + missing flags + icu_hours_elapsed + time_of_day.
+                   None values are preserved as NaN — XGBoost handles them natively.
+    Lag-1 (10):    {col}_lag1 for each col in BASE_VITAL_MEANS + BASE_LAB_LASTS.
+                   Set from previous_window[col] when available; None otherwise.
+    Delta (10):    {col}_delta = current - prev when both are present; None otherwise.
+    Aggregate (3): n_missing_vitals, n_missing_vitals_lag1, missing_trend.
 
-    Column order is taken from _state["feature_columns"] (the model's own
-    feature_names) rather than from the Pydantic field definition order, so
-    the DataFrame always aligns with what the model was trained on.
-
-    Parameters
-    ----------
-    features:
-        A PatientFeatures instance (validated by FastAPI before this is called).
-
-    Returns
-    -------
-    Single-row DataFrame with dtype float64 and columns in model order.
+    Column order follows FEATURE_COLS (from feature_cols_v3.json) with fallback
+    to model.get_booster().feature_names, then the static v1 derivation.
     """
-    raw: dict[str, Any] = features.model_dump()
+    raw: dict[str, Any] = request.model_dump()
 
-    # Record which fields were absent before any filling
-    was_none: set[str] = {k for k, v in raw.items() if v is None}
+    # Extract and remove non-feature fields before building the feature dict
+    stay_id = raw.pop("stay_id", None)
+    prev: dict[str, float] = raw.pop("previous_window", None) or {}
 
-    # Fill all None → 0.0 (covers both value fields and missing-flag fields)
-    imputed: dict[str, float] = {
-        k: float(v) if v is not None else 0.0 for k, v in raw.items()
+    # Base feature values — None preserved for XGBoost NaN handling
+    all_vals: dict[str, Optional[float]] = {
+        k: (float(v) if v is not None else None) for k, v in raw.items()
     }
 
-    # For every absent value field, force its missing-flag partner to 1.
-    for field in was_none:
-        if field.startswith("vital_") and not field.endswith("_missing"):
-            # "vital_220045_mean" → ["vital", "220045", "mean"]
-            # Joining the first two segments gives the shared prefix
-            flag = "_".join(field.split("_")[:2]) + "_missing"
-            if flag in imputed:
-                imputed[flag] = 1.0
+    # -- Lag-1 and delta features -----------------------------------------------
+    for col in BASE_VITAL_MEANS + BASE_LAB_LASTS:
+        current_val = all_vals.get(col)
+        if col in prev:
+            prev_val = float(prev[col])
+            all_vals[col + "_lag1"]  = prev_val
+            all_vals[col + "_delta"] = (
+                (current_val - prev_val) if current_val is not None else None
+            )
+        else:
+            all_vals[col + "_lag1"]  = None
+            all_vals[col + "_delta"] = None
 
-        elif field.startswith("lab_") and field.endswith("_last"):
-            # "lab_50912_last" → "lab_50912_missing"
-            flag = field.replace("_last", "_missing")
-            if flag in imputed:
-                imputed[flag] = 1.0
+    # -- Aggregate missing features -----------------------------------------------
+    vital_missing_cols = [f"vital_{iid}_missing" for iid in VITAL_ITEMIDS]
+    n_missing_vitals = sum(1 for c in vital_missing_cols if all_vals.get(c) == 1.0)
+    all_vals["n_missing_vitals"] = float(n_missing_vitals)
 
-    return pd.DataFrame([imputed])[_state["feature_columns"]]
+    if prev:
+        n_missing_vitals_lag1 = sum(
+            1 for c in vital_missing_cols if prev.get(c) == 1
+        )
+        all_vals["n_missing_vitals_lag1"] = float(n_missing_vitals_lag1)
+        all_vals["missing_trend"] = float(n_missing_vitals - n_missing_vitals_lag1)
+    else:
+        all_vals["n_missing_vitals_lag1"] = None
+        all_vals["missing_trend"] = None
+
+    # -- Assemble in authoritative column order -----------------------------------
+    feature_cols = (
+        _state["feature_columns"]
+        or FEATURE_COLS
+        or _static_feature_columns()
+    )
+    return pd.DataFrame([{col: all_vals.get(col) for col in feature_cols}])
 
 
 # ---------------------------------------------------------------------------
@@ -257,34 +309,37 @@ def _build_feature_row(features: BaseModel) -> pd.DataFrame:
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    """Return service liveness and model readiness.
+    """Return service liveness, model readiness, and model version.
 
     Returns
     -------
-    status       : "ok" (the process is alive and the web server is healthy)
-    model_loaded : true if the XGBoost model loaded successfully at startup;
-                   false if the model file was missing or raised an exception.
-                   When false, POST /predict will return HTTP 503.
+    status        : "ok" (the process is alive and the web server is healthy)
+    model_loaded  : true if xgboost_v3.json loaded successfully at startup
+    model_version : "v3"
     """
-    return HealthResponse(status="ok", model_loaded=_state["model"] is not None)
+    return HealthResponse(
+        status="ok",
+        model_loaded=_state["model"] is not None,
+        model_version=_MODEL_VERSION,
+    )
 
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(features: PatientFeatures) -> PredictionResponse:
+async def predict(request: PatientFeatures) -> PredictionResponse:
     """Accept one observation window and return a sepsis risk score.
 
-    Input fields are all optional.  Any field sent as null (or omitted) is
-    imputed to 0.0 server-side, with the corresponding missing-flag set to 1
-    so the model is aware which features were absent.
+    All 40 base feature fields are optional. None/omitted values are passed
+    as NaN and handled natively by XGBoost v3. Supply previous_window (a dict
+    of the same base feature names from the prior 6h window) to enable lag-1
+    and delta features, which improve recall on deteriorating patients.
 
     Returns
     -------
+    stay_id            : echoed from the request for client-side correlation
     sepsis_probability : model's predicted probability of sepsis in [0, 1]
-    alert              : true when probability >= threshold (0.35)
-    threshold          : the decision boundary applied (fixed at 0.35 — lower
-                         than 0.5 to favour recall; a missed sepsis case is
-                         more harmful than a spurious alert)
-    model_version      : opaque identifier for the loaded weights ("v1")
+    sepsis_alert       : true when probability >= threshold (0.49)
+    threshold          : Youden's J optimised on held-out validation set
+    model_version      : "v3"
 
     Raises
     ------
@@ -296,12 +351,13 @@ async def predict(features: PatientFeatures) -> PredictionResponse:
             detail="Model not loaded — check GET /health for details",
         )
 
-    row  = _build_feature_row(features)
+    row  = _build_feature_row(request)
     prob = float(_state["model"].predict_proba(row)[0, 1])
 
     return PredictionResponse(
+        stay_id=getattr(request, "stay_id", None),
         sepsis_probability=round(prob, 6),
-        alert=prob >= _ALERT_THRESHOLD,
+        sepsis_alert=prob >= _ALERT_THRESHOLD,
         threshold=_ALERT_THRESHOLD,
         model_version=_MODEL_VERSION,
     )
@@ -309,35 +365,30 @@ async def predict(features: PatientFeatures) -> PredictionResponse:
 
 @app.get("/features", response_model=FeaturesResponse)
 async def feature_list() -> FeaturesResponse:
-    """Return the ordered list of feature names expected by POST /predict.
+    """Return the ordered list of 63 feature names expected by POST /predict.
 
-    API consumers can call this endpoint to validate their input schema before
-    sending prediction requests.
-
-    If the model is loaded the list reflects its embedded feature_names (the
-    authoritative source).  If the model failed to load the list is derived
-    statically from VITAL_ITEMIDS / LAB_ITEMIDS, which matches the output
-    schema of compute_features() in src/features/feature_engineering.py.
+    Priority: FEATURE_COLS (from feature_cols_v3.json) → model embedded
+    feature_names → static v1 derivation (40 features, fallback only).
 
     Returns
     -------
-    features : ordered list of feature name strings
+    features : ordered list of feature name strings (63 for v3)
     count    : len(features) — convenience field for quick validation
     """
     cols = (
-        _state["feature_columns"]
-        if _state["feature_columns"]
-        else _static_feature_columns()
+        FEATURE_COLS
+        or _state["feature_columns"]
+        or _static_feature_columns()
     )
     return FeaturesResponse(features=cols, count=len(cols))
 
 
 def _static_feature_columns() -> list[str]:
-    """Compute the expected feature column list from module-level itemid constants.
+    """Derive the 40-feature v1 column list as a last-resort fallback.
 
-    This is the fallback used by GET /features when the model is not loaded.
-    Column order mirrors the output of compute_features() after dropping
-    stay_id, window_end, and sepsis_label.
+    Used only when both FEATURE_COLS and the model's embedded feature_names
+    are unavailable (i.e., both the model and feature_cols_v3.json failed to
+    load at startup).
     """
     cols: list[str] = []
     for iid in VITAL_ITEMIDS:
