@@ -352,6 +352,7 @@ async def predict(request: PatientFeatures) -> PredictionResponse:
         )
 
     row  = _build_feature_row(request)
+    row  = row.astype(float)
     prob = float(_state["model"].predict_proba(row)[0, 1])
 
     return PredictionResponse(
