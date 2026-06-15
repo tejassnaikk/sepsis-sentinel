@@ -39,12 +39,10 @@ LAB_ITEMIDS:   list[int] = [50912,  50813,  51301,  50885]
 _ALERT_THRESHOLD: float = 0.49
 _MODEL_VERSION:   str   = "v3"
 
-_MODEL_PATH: Path = (
-    Path(__file__).resolve().parent.parent.parent / "models_local" / "xgboost_v3.json"
-)
-_FEATURE_COLS_PATH: Path = (
-    Path(__file__).resolve().parent.parent.parent / "models_local" / "feature_cols_v3.json"
-)
+_MODEL_DIR: Path = Path(__file__).resolve().parent.parent.parent / "models_local"
+
+_MODEL_PATH: Path        = _MODEL_DIR / "xgboost_v3.json"
+_FEATURE_COLS_PATH: Path = _MODEL_DIR / "feature_cols_v3.json"
 
 # Populated at startup from feature_cols_v3.json; empty list until then
 FEATURE_COLS: list[str] = []
@@ -161,6 +159,14 @@ class FeaturesResponse(BaseModel):
     count: int
 
 
+class DriftRequest(BaseModel):
+    """Request body for POST /drift."""
+
+    windows: list[dict[str, float]]
+    # List of feature dicts, each representing one 6h window.
+    # Only base 40 features needed — lag features computed server-side.
+
+
 # ---------------------------------------------------------------------------
 # Application state
 #
@@ -215,6 +221,17 @@ async def lifespan(app: FastAPI):
             logger.info("Feature columns loaded: %d columns", len(FEATURE_COLS))
         except Exception as exc:
             logger.error("Feature columns load failed: %s", exc)
+
+    baseline_path = _MODEL_DIR / "feature_baseline.json"
+    if baseline_path.exists():
+        try:
+            with open(baseline_path) as f:
+                _state["baseline"] = json.load(f)
+            logger.info("Feature baseline loaded: %d features", len(_state["baseline"].get("mean", {})))
+        except Exception as exc:
+            logger.error("Feature baseline load failed: %s", exc)
+    else:
+        logger.warning("Feature baseline not found: %s  — /drift will return 503", baseline_path)
 
     yield  # application runs here
 
@@ -382,6 +399,86 @@ async def feature_list() -> FeaturesResponse:
         or _static_feature_columns()
     )
     return FeaturesResponse(features=cols, count=len(cols))
+
+
+@app.post("/drift")
+def detect_drift(request: DriftRequest):
+    """Score a batch of feature windows for data drift against the training baseline.
+
+    Compares incoming feature distributions to the training-set statistics in
+    feature_baseline.json. Drift is measured per feature via a combined score
+    of mean-shift (in training std-devs) and fraction of values outside the
+    training p10–p90 range. An overall score above 0.3 triggers drift_detected.
+
+    Returns
+    -------
+    n_windows             : number of windows in the batch
+    n_features_scored     : features present in both batch and baseline
+    overall_drift_score   : mean drift score across all scored features
+    drift_detected        : true when overall_drift_score > 0.3
+    drifted_features      : list of features with drift_score > 0.5
+    feature_drift         : per-feature breakdown dict
+    """
+    if "baseline" not in _state:
+        raise HTTPException(status_code=503, detail="Baseline not loaded")
+    if not request.windows:
+        raise HTTPException(status_code=400, detail="No windows provided")
+
+    baseline = _state["baseline"]
+    df = pd.DataFrame(request.windows).astype(float)
+
+    # Only score features present in both the batch and baseline
+    scored_features = [f for f in baseline["mean"] if f in df.columns]
+
+    drift_scores: dict[str, Any] = {}
+    drifted_features: list[str] = []
+
+    for feat in scored_features:
+        train_mean = baseline["mean"][feat]
+        train_std  = baseline["std"][feat]
+        train_p10  = baseline["p10"][feat]
+        train_p90  = baseline["p90"][feat]
+
+        if train_std == 0 or pd.isna(train_std):
+            continue
+
+        incoming_mean = float(df[feat].mean())
+        incoming_std  = float(df[feat].std()) if len(df) > 1 else 0.0
+
+        # Z-score of mean shift (how many training std-devs has the mean moved)
+        mean_shift = abs(incoming_mean - train_mean) / train_std
+
+        # Fraction of incoming values outside training p10-p90 range
+        out_of_range = float(((df[feat] < train_p10) | (df[feat] > train_p90)).mean())
+
+        # Combined drift score (0 = no drift, higher = more drift)
+        drift_score = round((mean_shift * 0.6 + out_of_range * 0.4), 4)
+
+        drift_scores[feat] = {
+            "drift_score": drift_score,
+            "mean_shift_z": round(mean_shift, 4),
+            "out_of_range_pct": round(out_of_range * 100, 2),
+            "incoming_mean": round(incoming_mean, 4),
+            "training_mean": round(train_mean, 4),
+        }
+
+        if drift_score > 0.5:
+            drifted_features.append(feat)
+
+    overall_drift_score = round(
+        sum(v["drift_score"] for v in drift_scores.values()) / len(drift_scores)
+        if drift_scores else 0.0,
+        4,
+    )
+
+    return {
+        "n_windows": len(df),
+        "n_features_scored": len(scored_features),
+        "overall_drift_score": overall_drift_score,
+        "drift_detected": overall_drift_score > 0.3,
+        "drifted_features": drifted_features,
+        "feature_drift": drift_scores,
+    }
 
 
 def _static_feature_columns() -> list[str]:
