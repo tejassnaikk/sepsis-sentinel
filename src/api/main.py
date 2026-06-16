@@ -27,6 +27,8 @@ import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, create_model
 
+from src.api.rag import retrieve as rag_retrieve
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -119,6 +121,15 @@ def _make_patient_features_model() -> type[BaseModel]:
               )),
     )
 
+    fields["include_rag"] = (
+        bool,
+        Field(default=False,
+              description=(
+                  "When true and stay_id is provided, retrieves the top-3 most "
+                  "relevant discharge note passages and includes them in the response."
+              )),
+    )
+
     return create_model("PatientFeatures", **fields)
 
 
@@ -150,6 +161,7 @@ class PredictionResponse(BaseModel):
     sepsis_alert: bool
     threshold: float
     model_version: str
+    rag_context: list[dict] = []
 
 
 class FeaturesResponse(BaseModel):
@@ -372,12 +384,17 @@ async def predict(request: PatientFeatures) -> PredictionResponse:
     row  = row.astype(float)
     prob = float(_state["model"].predict_proba(row)[0, 1])
 
+    rag_context = []
+    if getattr(request, "include_rag", False) and getattr(request, "stay_id", None) is not None:
+        rag_context = rag_retrieve(stay_id=request.stay_id, top_k=3)
+
     return PredictionResponse(
         stay_id=getattr(request, "stay_id", None),
         sepsis_probability=round(prob, 6),
         sepsis_alert=prob >= _ALERT_THRESHOLD,
         threshold=_ALERT_THRESHOLD,
         model_version=_MODEL_VERSION,
+        rag_context=rag_context,
     )
 
 
